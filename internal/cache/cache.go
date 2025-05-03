@@ -5,7 +5,7 @@ import (
 	"sync"
 )
 
-const DEFAULT_SHARD_COUNT = 256 // Must be power of 2 for bitwise AND
+const defaultShardCount = 256 // Must be power of 2 for bitwise AND
 
 // Cache is a sharded key-value store.
 type Cache struct {
@@ -21,14 +21,14 @@ type Shard struct {
 
 // New creates a new Cache instance with the default number of shards.
 func New() *Cache {
-	return NewWithShardCount(DEFAULT_SHARD_COUNT)
+	return NewWithShardCount(defaultShardCount)
 }
 
 // NewWithShardCount creates a new Cache instance with a specific number of shards.
 // shardCount must be a power of 2.
 func NewWithShardCount(shardCount int) *Cache {
 	if shardCount <= 0 || (shardCount&(shardCount-1)) != 0 {
-		shardCount = DEFAULT_SHARD_COUNT
+		shardCount = defaultShardCount
 	}
 	c := &Cache{
 		shards:    make([]*Shard, shardCount),
