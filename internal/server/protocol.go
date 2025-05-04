@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"sync"
 
 	"github.com/jasonrowsell/zerocache/pkg/protocol"
 )
@@ -33,6 +34,16 @@ type Response struct {
 	Value []byte
 }
 
+// Pool for temporary buffers used in ReadCommand/WriteResponse
+// Assuming max header + typical key/value might fit in 1KB often.
+var bufferPool = sync.Pool{
+	New: func() any {
+		// Allocate a buffer of 1KB default size.
+		b := make([]byte, 1024)
+		return &b // Return pointer to slice
+	},
+}
+
 // ReadCommand reads from the reader and parses a command according to the protocol.
 func ReadCommand(r io.Reader) (*Command, error) {
 	var header [9]byte // 1 (Cmd) + 4 (KeyLen) + 4 (ValLen)
@@ -51,38 +62,55 @@ func ReadCommand(r io.Reader) (*Command, error) {
 	if keyLen == 0 || keyLen > protocol.MaxKeySize {
 		return nil, fmt.Errorf("invalid key length: %d, (max %d)", keyLen, protocol.MaxKeySize)
 	}
-	if valLen == 0 || valLen > protocol.MaxValueSize {
+	if valLen > protocol.MaxValueSize {
 		return nil, fmt.Errorf("invalid value length: %d, (max %d)", valLen, protocol.MaxValueSize)
+	}
+	if valLen > 0 && (cmdType == protocol.CmdGet || cmdType == protocol.CmdDel) {
+		return nil, fmt.Errorf("protocol violation: value data sent for non-SET command (type %d)", cmdType)
 	}
 
 	cmd := &Command{Type: cmdType}
 
-	// Read Key (allocate buffer once)
-	keyBuf := make([]byte, keyLen)
-	if _, err := io.ReadFull(r, keyBuf); err != nil {
-		if err == io.EOF || err == io.ErrUnexpectedEOF {
-			return nil, fmt.Errorf("eof while reading key: %w", err)
-		}
-		return nil, fmt.Errorf("failed to read key data: %w", err)
-	}
-	cmd.Key = string(keyBuf)
+	totalPayloadLen := keyLen + valLen // valLen is 0 for GET/DEL
+	var payloadBufPtr *[]byte
+	var payloadBuf []byte // Holds key (and potentially value for SET)
 
-	// Read Value only if needed (SET cmd)
-	if cmdType == protocol.CmdSet && valLen > 0 {
-		cmd.Value = make([]byte, valLen)
-		if _, err := io.ReadFull(r, cmd.Value); err != nil {
+	// Get buffer from pool
+	payloadBufPtr = bufferPool.Get().(*[]byte)
+	// Only need buffer size for key if not SET, else key+value
+	neededSize := int(keyLen)
+	if cmdType == protocol.CmdSet {
+		neededSize = int(totalPayloadLen)
+	}
+
+	if cap(*payloadBufPtr) < neededSize {
+		bufferPool.Put(payloadBufPtr) // Put back small one
+		payloadBuf = make([]byte, neededSize)
+	} else {
+		// Use buffer from pool, slice it to the needed length
+		payloadBuf = (*payloadBufPtr)[:neededSize]
+	}
+	// Ensure buffer is put back when done
+	defer func() {
+		bufferPool.Put(payloadBufPtr)
+	}()
+
+	if neededSize > 0 {
+		if _, err := io.ReadFull(r, payloadBuf); err != nil {
 			if err == io.EOF || err == io.ErrUnexpectedEOF {
-				return nil, fmt.Errorf("eof while reading value: %w", err)
+				return nil, fmt.Errorf("eof while reading key: %w", err)
 			}
-			return nil, fmt.Errorf("failed to read value data: %w", err)
+			return nil, fmt.Errorf("failed to read key data: %w", err)
 		}
-	} else if cmdType == protocol.CmdSet && valLen == 0 {
-		// Handle setting empty value explicitly
-		cmd.Value = []byte{}
-	} else if valLen > 0 && (cmdType == protocol.CmdGet || cmdType == protocol.CmdDel) {
-		// Client sent value data for GET/DEL, protocol violation
-		// Discard these bytes to not desync the stream
-		return nil, fmt.Errorf("procoal violation: value data sent for %s command", cmd.Name())
+	}
+
+	// Extract key and value from the buffer
+	cmd.Key = string(payloadBuf[:keyLen])
+	if cmdType == protocol.CmdSet {
+		// Copy value from buffer into the command struct
+		// Cache needs to own its copy
+		cmd.Value = make([]byte, valLen)
+		copy(cmd.Value, payloadBuf[keyLen:totalPayloadLen])
 	}
 
 	switch cmdType {
@@ -98,28 +126,66 @@ func ReadCommand(r io.Reader) (*Command, error) {
 // WriteResponse formats and writes a response to the writer.
 func WriteResponse(w io.Writer, resp *Response) error {
 	valLen := uint32(len(resp.Value))
+	headerLen := 5
 
 	if valLen > protocol.MaxValueSize {
+		errMsg := "internal: response value exceeds maximum size"
+		if len(errMsg) > protocol.MaxValueSize {
+			errMsg = errMsg[:protocol.MaxValueSize] // Truncate
+		}
 		errResp := &Response{
 			Type:  protocol.RespError,
-			Value: []byte("internal: response value exceeds maximum limit"),
+			Value: []byte(errMsg),
 		}
-		return WriteResponse(w, errResp) // Recursive call with the error response
+
+		totalLen := headerLen + len(errResp.Value)
+		buf := make([]byte, totalLen)
+		buf[0] = errResp.Type
+		binary.BigEndian.PutUint32(buf[1:5], uint32(len(errResp.Value)))
+		copy(buf[headerLen:], errResp.Value)
+		if _, writeErr := w.Write(buf); writeErr != nil {
+			return fmt.Errorf("failed to write truncated error response: %w", writeErr)
+		}
+		return fmt.Errorf("original response value exceeds maximum size")
+	}
+	if (resp.Type == protocol.RespOK || resp.Type == protocol.RespNotFound) && valLen != 0 {
+		errMsg := fmt.Sprintf("internal: unexpected value data with response type %d", resp.Type)
+		errResp := &Response{Type: protocol.RespError, Value: []byte(errMsg)}
+		totalLen := headerLen + len(errResp.Value)
+		buf := make([]byte, totalLen)
+		buf[0] = errResp.Type
+		binary.BigEndian.PutUint32(buf[1:5], uint32(len(errResp.Value)))
+		copy(buf[headerLen:], errResp.Value)
+		if _, writeErr := w.Write(buf); writeErr != nil {
+			return fmt.Errorf("failed to write internal protocol error response: %w", writeErr)
+		}
+		return fmt.Errorf("internal server error: tried to send data with OK/NotFound")
 	}
 
-	var header [5]byte // 1 (RespType) + 4 (ValLen)
-	header[0] = resp.Type
-	binary.BigEndian.PutUint32(header[1:5], valLen)
+	totalLen := headerLen + int(valLen)
 
-	// Write header
-	if _, err := w.Write(header[:]); err != nil {
-		return fmt.Errorf("failed to write response header: %w", err)
+	// Get buffer from pool
+	bufPtr := bufferPool.Get().(*[]byte)
+	var buf []byte
+	if cap(*bufPtr) < totalLen {
+		buf = make([]byte, totalLen) // Put small one back
+	} else {
+		buf = (*bufPtr)[:totalLen]
 	}
+	defer func() {
+		bufferPool.Put(bufPtr)
+	}()
 
+	// Write header and value into the pooled buffer
+	buf[0] = resp.Type
+	binary.BigEndian.PutUint32(buf[1:5], valLen)
 	if valLen > 0 {
-		if _, err := w.Write(resp.Value); err != nil {
-			return fmt.Errorf("failed to write response value/error: %w", err)
-		}
+		copy(buf[headerLen:], resp.Value)
+	}
+
+	// Write the entire buffer in one go
+	if _, err := w.Write(buf); err != nil {
+		return fmt.Errorf("failed to write response buffer: %w", err)
 	}
 
 	return nil
@@ -127,6 +193,9 @@ func WriteResponse(w io.Writer, resp *Response) error {
 
 // WriteError is a helper function to write an error response.
 func WriteError(w io.Writer, errMsg string) error {
+	if len(errMsg) > protocol.MaxValueSize {
+		errMsg = errMsg[:protocol.MaxValueSize] // Truncate
+	}
 	resp := &Response{Type: protocol.RespError, Value: []byte(errMsg)}
 
 	return WriteResponse(w, resp)
