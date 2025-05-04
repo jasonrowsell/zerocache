@@ -9,6 +9,7 @@ import (
 	"sync"
 
 	"github.com/jasonrowsell/zerocache/internal/cache"
+	"github.com/jasonrowsell/zerocache/pkg/protocol"
 )
 
 // Server holds the dependencies for the ZeroCache server.
@@ -105,18 +106,18 @@ func (s *Server) handleConnection(conn net.Conn) {
 
 func (s *Server) executeCommand(cmd *Command) (*Response, error) {
 	switch cmd.Type {
-	case CmdSet:
+	case protocol.CmdSet:
 		s.cache.Set(cmd.Key, cmd.Value)
-		return &Response{Type: RespOK}, nil
-	case CmdGet:
+		return &Response{Type: protocol.RespOK}, nil
+	case protocol.CmdGet:
 		value, found := s.cache.Get(cmd.Key)
 		if !found {
-			return &Response{Type: RespNotfound}, nil
+			return &Response{Type: protocol.RespNotfound}, nil
 		}
-		return &Response{Type: RespOK, Value: value}, nil
-	case CmdDel:
+		return &Response{Type: protocol.RespOK, Value: value}, nil
+	case protocol.CmdDel:
 		s.cache.Delete(cmd.Key)
-		return &Response{Type: RespOK}, nil
+		return &Response{Type: protocol.RespOK}, nil
 	default:
 		return nil, fmt.Errorf("unknown command type: %d", cmd.Type)
 	}
