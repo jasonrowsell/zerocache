@@ -5,8 +5,10 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"sync"
+	"time"
 
 	"github.com/jasonrowsell/zerocache/pkg/protocol"
 )
@@ -24,32 +26,54 @@ type Client struct {
 	reader *bufio.Reader
 	writer *bufio.Writer
 	addr   string
-	// Simple mutex to protect concurrent use of the same client connection
+	// Mutex to protect concurrent use of the same client connection
 	// for sending/receiving.
 	mu sync.Mutex
 }
 
-// New connects to a ZeroCache server.
+var clientBufferPool = sync.Pool{
+	New: func() any {
+		b := make([]byte, 1024)
+		return &b
+	},
+}
+
 func New(addr string) (*Client, error) {
-	// TODO: Add conn timeout
-	conn, err := net.Dial("tcp", addr)
+	connTimeout := 2 * time.Second
+	conn, err := net.DialTimeout("tcp", addr, connTimeout)
 	if err != nil {
-		return nil, fmt.Errorf("failed to connect to %s: %w", addr, err)
+		return nil, fmt.Errorf("failed to dial %s: %w", addr, err)
 	}
 
+	return NewWithConn(conn)
+}
+
+// NewWithConn creates a new client using an existing network connection.
+// It assumes the caller might have already configured the connection (e.g., deadlines, options).
+// It ensures TCP_NODELAY is set if it's a TCP connection.
+func NewWithConn(conn net.Conn) (*Client, error) {
+	if conn == nil {
+		return nil, fmt.Errorf("cannot create client with nil connection")
+	}
+
+	// Ensure TCP_NODELAY is set for low latency, idempotent if already set.
 	if tcpConn, ok := conn.(*net.TCPConn); ok {
-		tcpConn.SetNoDelay(true)
+		_ = tcpConn.SetNoDelay(true)
+	}
+
+	addrStr := "unknown"
+	if remoteAddr := conn.RemoteAddr(); remoteAddr != nil {
+		addrStr = remoteAddr.String()
 	}
 
 	return &Client{
 		conn:   conn,
 		reader: bufio.NewReader(conn),
 		writer: bufio.NewWriter(conn),
-		addr:   addr,
+		addr:   addrStr,
 	}, nil
 }
 
-// Close closes the connection to the server.
 func (c *Client) Close() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -61,6 +85,45 @@ func (c *Client) Close() error {
 	return err
 }
 
+// sendCommand serializes and sends a command. Assumes lock is held.
+func (c *Client) sendCommand(cmdType uint8, key string, value []byte) error {
+	keyLen := len(key)
+	valLen := len(value) // Will be 0 if value is nil/empty
+
+	// Prepare header + key + value buffer
+	bufSize := 1 + 4 + 4 + keyLen + valLen
+	bufPtr := clientBufferPool.Get().(*[]byte)
+	var buf []byte
+	if cap(*bufPtr) < bufSize {
+		clientBufferPool.Put(bufPtr) // Put back small one
+		buf = make([]byte, bufSize)
+	} else {
+		buf = (*bufPtr)[:bufSize]
+	}
+	defer clientBufferPool.Put(bufPtr) // Put back when done
+
+	buf[0] = cmdType
+	binary.BigEndian.PutUint32(buf[1:5], uint32(keyLen))
+	binary.BigEndian.PutUint32(buf[5:9], uint32(valLen))
+	copy(buf[9:9+keyLen], key)
+	if valLen > 0 {
+		copy(buf[9+keyLen:], value)
+	}
+
+	// Write the entire command
+	if _, err := c.writer.Write(buf); err != nil {
+		c.closeConnOnError(err)
+		return fmt.Errorf("write error: %w", err)
+	}
+
+	// Flush the writer buffer
+	if err := c.writer.Flush(); err != nil {
+		c.closeConnOnError(err)
+		return fmt.Errorf("flush error: %w", err)
+	}
+	return nil
+}
+
 // Set sends a SET command to the server.
 func (c *Client) Set(key string, value []byte) error {
 	c.mu.Lock()
@@ -69,54 +132,30 @@ func (c *Client) Set(key string, value []byte) error {
 	if c.conn == nil {
 		return fmt.Errorf("client closed")
 	}
-
-	keyLen := len(key)
-	valLen := len(value)
-
-	if keyLen == 0 || keyLen > protocol.MaxKeySize {
-		return fmt.Errorf("invalid key length: %d", keyLen)
+	if len(key) == 0 || len(key) > protocol.MaxKeySize {
+		return fmt.Errorf("invalid key length")
 	}
-	if valLen > protocol.MaxValueSize {
-		// TODO: Maybe close connection?
-		// For now, return generic error
-		return fmt.Errorf("invalid value length: %d", valLen)
+	if len(value) > protocol.MaxValueSize {
+		return fmt.Errorf("invalid value length")
+	} // len=0 is OK
+
+	if err := c.sendCommand(protocol.CmdSet, key, value); err != nil {
+		return err
 	}
-
-	// Prepare header + key + value buffer (avoid multiple writes)
-	// Size: 1 (Cmd) + 4 (KeyLen) + 4 (ValLen) + KeyLen + ValLen
-	bufSize := 1 + 4 + 4 + keyLen + valLen
-	buf := make([]byte, bufSize) // TODO: sync.Pool
-
-	buf[0] = protocol.CmdSet
-	binary.BigEndian.PutUint32(buf[1:5], uint32(keyLen))
-	binary.BigEndian.PutUint32(buf[5:9], uint32(valLen))
-	copy(buf[9:9+keyLen], key)
-	copy(buf[9+keyLen:], value)
-
-	if _, err := c.writer.Write(buf); err != nil {
-		// TODO: Handle connection errors more robustly (e.g., reconnect?)
-		return fmt.Errorf("failed to write set command: %w", err)
-	}
-	if err := c.writer.Flush(); err != nil {
-		return fmt.Errorf("failed to flush writer: %w", err)
-	}
-
-	respType, _, err := c.readResponseHeader()
+	respType, respValue, err := c.readResponse()
 	if err != nil {
-		return fmt.Errorf("failed to read set response header: %w", err)
+		return err
 	}
 
 	switch respType {
 	case protocol.RespOK:
 		return nil
 	case protocol.RespError:
-		errMsg, err := c.readResponseValue(err, uint32(valLen))
-		if err != nil {
-			return fmt.Errorf("failed to read error response body: %w", err)
-		}
-		return Error(errMsg)
+		return Error(respValue)
 	default:
-		return fmt.Errorf("protocol error: expected response type %d for SET", respType)
+		err = fmt.Errorf("protocol error: unexpected response type %d for SET", respType)
+		c.closeConnOnError(err)
+		return err
 	}
 }
 
@@ -128,55 +167,32 @@ func (c *Client) Get(key string) ([]byte, error) {
 	if c.conn == nil {
 		return nil, fmt.Errorf("client closed")
 	}
-
-	keyLen := len(key)
-	if keyLen == 0 || keyLen > protocol.MaxKeySize {
-		return nil, fmt.Errorf("invalid key length: %d", keyLen)
+	if len(key) == 0 || len(key) > protocol.MaxKeySize {
+		return nil, fmt.Errorf("invalid key length")
 	}
 
-	// Prepare header + key buffer
-	// Size: 1 (Cmd) + 4 (KeyLen) + 4 (ValLen=0) + KeyLen
-	bufSize := 1 + 4 + 4 + keyLen
-	buf := make([]byte, bufSize) // TODO: Use sync.Pool
-
-	buf[0] = protocol.CmdGet
-	binary.BigEndian.PutUint32(buf[1:5], uint32(keyLen))
-	binary.BigEndian.PutUint32(buf[5:9], 0) // Value length is 0 for GET
-	copy(buf[9:9+keyLen], key)
-
-	if _, err := c.writer.Write(buf); err != nil {
-		return nil, fmt.Errorf("failed to write get command: %w", err)
-	}
-	if err := c.writer.Flush(); err != nil {
-		return nil, fmt.Errorf("failed to flush writer: %w", err)
+	if err := c.sendCommand(protocol.CmdGet, key, nil); err != nil {
+		return nil, err
 	}
 
-	respType, valLen, err := c.readResponseHeader()
+	respType, respValue, err := c.readResponse()
 	if err != nil {
-		return nil, fmt.Errorf("failed to read get response header: %w", err)
+		return nil, err
 	}
 
 	switch respType {
 	case protocol.RespValue:
-		value, err := c.readResponseValue(err, valLen)
-		if err != nil {
-			return nil, fmt.Errorf("failed to read value response body: %w", err)
-		}
-		return value, nil
-	case protocol.RespNotfound:
-		if valLen > 0 {
-			return nil, fmt.Errorf("protocol error: received NotFound with value length %d", valLen)
-		}
+		return respValue, nil
+	case protocol.RespNotFound:
 		return nil, ErrNotFound
 	case protocol.RespError:
-		errMsg, err := c.readResponseValue(err, valLen)
-		if err != nil {
-			return nil, fmt.Errorf("failed to read error response body: %w", err)
-		}
-		return nil, Error(errMsg)
+		return nil, Error(respValue)
 	default:
-		return nil, fmt.Errorf("protocol error: unexpected response type %d for GET", respType)
+		err = fmt.Errorf("protocol error: unexpected response type %d for GET", respType)
+		c.closeConnOnError(err)
+		return nil, err
 	}
+
 }
 
 // Set sends a DELETE command to the server.
@@ -187,89 +203,116 @@ func (c *Client) Delete(key string) error {
 	if c.conn == nil {
 		return fmt.Errorf("client closed")
 	}
-
-	keyLen := len(key)
-	if keyLen == 0 || keyLen > protocol.MaxKeySize {
-		return fmt.Errorf("invalid key length: %d", keyLen)
+	if len(key) == 0 || len(key) > protocol.MaxKeySize {
+		return fmt.Errorf("invalid key length")
 	}
 
-	// Prepare header + key buffer
-	// Size: 1 (Cmd) + 4 (KeyLen) + 4 (ValLen=0) + KeyLen
-	bufSize := 1 + 4 + 4 + keyLen
-	buf := make([]byte, bufSize) // TODO: Use sync.Pool
-
-	buf[0] = protocol.CmdDel
-	binary.BigEndian.PutUint32(buf[1:5], uint32(keyLen))
-	binary.BigEndian.PutUint32(buf[5:9], 0) // Value length is 0 for DEL
-	copy(buf[9:9+keyLen], key)
-
-	if _, err := c.writer.Write(buf); err != nil {
-		return fmt.Errorf("failed to write delete command: %w", err)
-	}
-	if err := c.writer.Flush(); err != nil {
-		return fmt.Errorf("failed to flush writer: %w", err)
+	if err := c.sendCommand(protocol.CmdDel, key, nil); err != nil {
+		return err
 	}
 
-	respType, valLen, err := c.readResponseHeader()
+	respType, respValue, err := c.readResponse()
 	if err != nil {
-		return fmt.Errorf("failed to read delete response header: %w", err)
+		return err
 	}
 
 	switch respType {
 	case protocol.RespOK:
-		if valLen > 0 {
-			return fmt.Errorf("protocol error: received OK with value length %d", valLen)
-		}
 		return nil
 	case protocol.RespError:
-		errMsg, err := c.readResponseValue(err, uint32(valLen))
-		if err != nil {
-			return fmt.Errorf("failed to read error response body: %w", err)
-		}
-		return Error(errMsg)
+		return Error(respValue)
 	default:
-		return fmt.Errorf("protocol error: expected response type %d for DELETE", respType)
+		err = fmt.Errorf("protocol error: unexpected response type %d for DELETE", respType)
+		c.closeConnOnError(err)
+		return err
 	}
 }
 
-// readResponseHeader reads the common 5-byte header.
-// Returns response, value length, and error.
-func (c *Client) readResponseHeader() (uint8, uint32, error) {
+// readResponse reads and parses the response header and body. Assumes lock is held.
+// It returns the response type code, the value (if applicable), and any error encountered.
+func (c *Client) readResponse() (respType uint8, value []byte, err error) {
 	var header [5]byte // 1 (RespType) + 4 (ValLen)
 
-	// Ensure we have all 5 bytes or an error (e.g., EOF)
-	if _, err := io.ReadFull(c.reader, header[:]); err != nil {
-		return 0, 0, fmt.Errorf("connection error reading header: %w", err)
+	// Read the fixed-size header
+	if _, err = io.ReadFull(c.reader, header[:]); err != nil {
+		// If an error occurs reading the header (e.g., connection closed, timeout),
+		// mark the connection as potentially unusable and return the error.
+		c.closeConnOnError(err)
+		return 0, nil, fmt.Errorf("read header error: %w", err)
 	}
 
-	respType := header[0]
+	// Parse the header fields
+	respType = header[0]
 	valLen := binary.BigEndian.Uint32(header[1:5])
 
-	if (respType == protocol.RespOK || respType == protocol.RespNotfound) && valLen != 0 {
-		return respType, valLen, fmt.Errorf("protocol error: unexpected non-zero length %d for response type %d", valLen, respType)
+	if (respType == protocol.RespOK || respType == protocol.RespNotFound) && valLen != 0 {
+		err = fmt.Errorf("protocol error: unexpected non-zero length %d for response type %d", valLen, respType)
+		c.closeConnOnError(err)
+		return respType, nil, err
 	}
 	if valLen > protocol.MaxValueSize {
-		return respType, valLen, fmt.Errorf("protocol error: response value length %d exceeds maximum %d", valLen, protocol.MaxValueSize)
+		err = fmt.Errorf("protocol error: response value length %d exceeds client maximum %d", valLen, protocol.MaxValueSize)
+		c.closeConnOnError(err)
+		return respType, nil, err
 	}
 
-	return respType, valLen, nil
+	if valLen > 0 {
+		// Get a buffer from the pool for reading the value data.
+		bufPtr := clientBufferPool.Get().(*[]byte)
+		var readBuf []byte
+		if cap(*bufPtr) < int(valLen) {
+			// Pooled buffer is too small; put it back and allocate a new one.
+			clientBufferPool.Put(bufPtr)
+			readBuf = make([]byte, valLen)
+		} else {
+			// Pooled buffer is large enough; slice it to the exact size needed.
+			readBuf = (*bufPtr)[:valLen]
+		}
+		// Ensure the read buffer is returned to the pool when this function exits.
+		defer clientBufferPool.Put(bufPtr)
+
+		// Read the value data fully into the readBuf.
+		if _, err = io.ReadFull(c.reader, readBuf); err != nil {
+			c.closeConnOnError(err)
+			return respType, nil, fmt.Errorf("read value error: %w", err)
+		}
+
+		// Copy data from the pooled buffer.
+		// We cannot return `readBuf` directly, as it belongs to the pool and will be reused.
+		// We must allocate a new slice (`value`) and copy the data into it.
+		value = make([]byte, valLen)
+		copy(value, readBuf)
+
+	} // else valLen is 0, so `value` remains nil (or its zero value, an empty slice)
+
+	return respType, value, nil
 }
 
-// readResponseValue reads the value/error message part of a response, given the length from the header.
-// The 'headerErr' is passed in case the caller already encountered an error reading the header,
-// in which case we just return that error.
-func (c *Client) readResponseValue(headerErr error, valLen uint32) ([]byte, error) {
-	if headerErr != nil {
-		return nil, headerErr
+// closeConnOnError closes the connection and marks the client as closed when a fatal error occurs.
+// Assumes lock is already held or not needed (e.g., called from defer).
+func (c *Client) closeConnOnError(err error) {
+	// Check for common "connection closed" errors to avoid redundant closing
+	if c.conn != nil && err != nil && err != io.EOF && !isConnClosedError(err) {
+		log.Printf("Client connection error (%v), closing connection to %s", err, c.addr)
+		c.conn.Close()
+		c.conn = nil
+	} else if c.conn != nil && err == io.EOF {
+		// EOF might just mean peer closed gracefully, mark as closed
+		c.conn.Close()
+		c.conn = nil
 	}
-	if valLen == 0 {
-		return []byte{}, nil
-	}
+}
 
-	valueBuf := make([]byte, valLen) // TODO: Use sync.Pool
-	if _, err := io.ReadFull(c.reader, valueBuf); err != nil {
-		return nil, fmt.Errorf("connection error reading value body: %w", err)
+// isConnClosedError checks for common network errors indicating closure.
+func isConnClosedError(err error) bool {
+	if err == nil {
+		return false
 	}
-
-	return valueBuf, nil
+	// Check for common net package errors related to closed connections
+	if opErr, ok := err.(*net.OpError); ok {
+		return opErr.Err.Error() == "use of closed network connection" ||
+			opErr.Err.Error() == "connection reset by peer" ||
+			opErr.Err.Error() == "broken pipe"
+	}
+	return err == net.ErrClosed
 }
