@@ -12,7 +12,7 @@ const (
 	RespOK       uint8 = 1 // Generic OK
 	RespError    uint8 = 2 // Error message follows
 	RespValue    uint8 = 3 // Value data follows
-	RespNotfound uint8 = 4 // Key not found (specific to GET)
+	RespNotFound uint8 = 4 // Key not found (specific to GET)
 )
 
 // Size constants
