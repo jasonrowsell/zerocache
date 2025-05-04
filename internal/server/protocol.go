@@ -4,21 +4,8 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
-)
 
-// Command types
-const (
-	CmdSet uint8 = 1
-	CmdGet uint8 = 2
-	CmdDel uint8 = 3
-)
-
-// Response types
-const (
-	RespOK       uint8 = 1 // Generic OK
-	RespError    uint8 = 2 // Error message follows
-	RespValue    uint  = 3 // Value data follows
-	RespNotfound uint8 = 4 // Key not found (specific to GET)
+	"github.com/jasonrowsell/zerocache/pkg/protocol"
 )
 
 type Command struct {
@@ -30,11 +17,11 @@ type Command struct {
 // Name returns human-readable name for the command type.
 func (c *Command) Name() string {
 	switch c.Type {
-	case CmdSet:
+	case protocol.CmdSet:
 		return "SET"
-	case CmdGet:
+	case protocol.CmdGet:
 		return "GET"
-	case CmdDel:
+	case protocol.CmdDel:
 		return "DELETE"
 	default:
 		return "UNKNOWN"
@@ -45,9 +32,6 @@ type Response struct {
 	Type  uint8
 	Value []byte
 }
-
-const maxKeySize = 1028        // 1KB limit for keys
-const maxValueSize = 64 * 1028 // 64KB limit for values
 
 // ReadCommand reads from the reader and parses a command according to the protocol.
 func ReadCommand(r io.Reader) (*Command, error) {
@@ -64,11 +48,11 @@ func ReadCommand(r io.Reader) (*Command, error) {
 	keyLen := binary.BigEndian.Uint32(header[1:5])
 	valLen := binary.BigEndian.Uint32(header[5:9])
 
-	if keyLen == 0 || keyLen > maxKeySize {
-		return nil, fmt.Errorf("invalid key length: %d, (max %d)", keyLen, maxKeySize)
+	if keyLen == 0 || keyLen > protocol.MaxKeySize {
+		return nil, fmt.Errorf("invalid key length: %d, (max %d)", keyLen, protocol.MaxKeySize)
 	}
-	if valLen == 0 || valLen > maxValueSize {
-		return nil, fmt.Errorf("invalid key length: %d, (max %d)", keyLen, maxKeySize)
+	if valLen == 0 || valLen > protocol.MaxValueSize {
+		return nil, fmt.Errorf("invalid value length: %d, (max %d)", valLen, protocol.MaxValueSize)
 	}
 
 	cmd := &Command{Type: cmdType}
@@ -84,7 +68,7 @@ func ReadCommand(r io.Reader) (*Command, error) {
 	cmd.Key = string(keyBuf)
 
 	// Read Value only if needed (SET cmd)
-	if cmdType == CmdSet && valLen > 0 {
+	if cmdType == protocol.CmdSet && valLen > 0 {
 		cmd.Value = make([]byte, valLen)
 		if _, err := io.ReadFull(r, cmd.Value); err != nil {
 			if err == io.EOF || err == io.ErrUnexpectedEOF {
@@ -92,17 +76,17 @@ func ReadCommand(r io.Reader) (*Command, error) {
 			}
 			return nil, fmt.Errorf("failed to read value data: %w", err)
 		}
-	} else if cmdType == CmdSet && valLen == 0 {
+	} else if cmdType == protocol.CmdSet && valLen == 0 {
 		// Handle setting empty value explicitly
 		cmd.Value = []byte{}
-	} else if valLen > 0 && (cmdType == CmdGet || cmdType == CmdDel) {
+	} else if valLen > 0 && (cmdType == protocol.CmdGet || cmdType == protocol.CmdDel) {
 		// Client sent value data for GET/DEL, protocol violation
 		// Discard these bytes to not desync the stream
 		return nil, fmt.Errorf("procoal violation: value data sent for %s command", cmd.Name())
 	}
 
 	switch cmdType {
-	case CmdSet, CmdGet, CmdDel:
+	case protocol.CmdSet, protocol.CmdGet, protocol.CmdDel:
 		// Valid
 	default:
 		return nil, fmt.Errorf("unknown command type: %d", cmdType)
@@ -115,9 +99,9 @@ func ReadCommand(r io.Reader) (*Command, error) {
 func WriteResponse(w io.Writer, resp *Response) error {
 	valLen := uint32(len(resp.Value))
 
-	if valLen > maxValueSize {
+	if valLen > protocol.MaxValueSize {
 		errResp := &Response{
-			Type:  RespError,
+			Type:  protocol.RespError,
 			Value: []byte("internal: response value exceeds maximum limit"),
 		}
 		return WriteResponse(w, errResp) // Recursive call with the error response
@@ -143,7 +127,7 @@ func WriteResponse(w io.Writer, resp *Response) error {
 
 // WriteError is a helper function to write an error response.
 func WriteError(w io.Writer, errMsg string) error {
-	resp := &Response{Type: RespError, Value: []byte(errMsg)}
+	resp := &Response{Type: protocol.RespError, Value: []byte(errMsg)}
 
 	return WriteResponse(w, resp)
 }
