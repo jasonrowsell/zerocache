@@ -88,7 +88,6 @@ func runInteractiveMode(addr string) {
 
 		commandUpper := strings.ToUpper(parts[0])
 
-		// Handle client-side commands
 		if commandUpper == "QUIT" || commandUpper == "EXIT" {
 			fmt.Println("Exiting.")
 			return
