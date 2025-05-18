@@ -12,8 +12,9 @@ import (
 )
 
 var (
-	listenAddr = flag.String("listen", ":6380", "Address to listen on (e.g., :6380 or 127.0.0.1:6380)")
-	shardCount = flag.Int("shards", 256, "Number of cache shards (must be power of 2)")
+	listenAddr       = flag.String("listen", ":6380", "Address to listen on (e.g., :6380 or 127.0.0.1:6380)")
+	shardCount       = flag.Int("shards", 256, "Number of cache shards (must be power of 2)")
+	maxItemsPerShard = flag.Int("max-items", 1024, "Max items per shard (0 for unlimited)")
 )
 
 func main() {
@@ -23,11 +24,18 @@ func main() {
 	if *shardCount <= 0 || (*shardCount&(*shardCount-1)) != 0 {
 		log.Fatalf("Error: shard count (-shards=%d) must be a positive power of 2.", *shardCount)
 	}
+	if *maxItemsPerShard < 0 {
+		log.Fatalf("Error: max items per shard (-max-items=%d) cannot be negative.", *maxItemsPerShard)
+	}
 
 	log.Println("Starting ZeroCache server...")
-	log.Printf("Configuration: Listen Addr=%s, Shards=%d", *listenAddr, *shardCount)
+	log.Printf("Configuration: Listen Addr=%s, Shards=%d, MaxItems/Shard=%d", *listenAddr, *shardCount, *maxItemsPerShard)
 
-	c := cache.NewWithShardCount(*shardCount)
+	cacheConfig := cache.Config{
+		ShardCount:       *shardCount,
+		MaxItemsPerShard: *maxItemsPerShard,
+	}
+	c := cache.NewWithConfig(cacheConfig)
 
 	svr := server.New(c)
 
