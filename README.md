@@ -36,7 +36,7 @@ Running the Server (`zerocached`)
 ./bin/zerocached
 
 # Start with custom settings
-./bin/zerocached -listen=":7000" -metrics=":9200" -shards=512 -max-items=10000
+./bin/zerocached -listen=":7000" -shards=512 -max-items=10000
 ```
 Server Flags:
 
