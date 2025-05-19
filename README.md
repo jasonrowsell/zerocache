@@ -99,3 +99,18 @@ go test ./internal/cache
 go test -bench=. -benchmem ./internal/cache
 go test -bench=E2E -benchmem ./cmd/zerocached
 ```
+
+
+## Features
+
+*   **In-Memory Storage**: All data is stored in RAM for maximum speed.
+*   **Sharded Architecture**:
+    *   **Internal Sharding**: The cache data is sharded internally across multiple maps, each protected by its own mutex, to reduce lock contention and improve concurrency on multi-core systems.
+    *   **Client-Side Sharding**: A `ShardedClient` is provided to distribute keys across multiple independent ZeroCache server instances, enabling horizontal scaling of throughput and capacity.
+*   **Custom Binary Protocol**: A simple, low-overhead binary protocol is used for communication between the client and server to minimize parsing costs.
+*   **LRU Eviction**: Implements a Least Recently Used (LRU) eviction policy per shard to manage memory usage when capacity limits are reached.
+*   **Low-Latency Focus**: Design choices prioritize reducing latency, including:
+    *   Careful memory allocation management (`sync.Pool` for I/O buffers).
+    *   `TCP_NODELAY` enabled to reduce network transmission delays.
+*   **CLI Tool (`zerocli`)**: An interactive command-line interface similar to `redis-cli` for easy interaction with the cache server.
+*   **Go Implementation**: Leverages Go's concurrency primitives (goroutines, channels) and networking libraries.
