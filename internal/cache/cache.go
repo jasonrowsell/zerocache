@@ -6,8 +6,10 @@ import (
 	"sync"
 )
 
-const defaultShardCount = 256 // Must be power of 2 for bitwise AND
-const defaultMaxItemsPerShard = 1024
+const (
+	defaultShardCount       = 256 // Must be power of 2 for bitwise AND
+	defaultMaxItemsPerShard = 1024
+)
 
 // cacheEntry holds the value and a pointer to its corresponding element in the LRU list.
 type cacheEntry struct {
